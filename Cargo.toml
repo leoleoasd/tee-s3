@@ -1,6 +1,6 @@
 [package]
 authors = ["Yuxuan Lu <i@yuxuan.lu>"]
-categories = ["cli"]
+categories = ["command-line-utilities"]
 description = "A command-line utility that streams stdin to both stdout and Amazon S3, similar to the Unix `tee` command but with S3 as an output."
 edition = "2021"
 homepage = "https://github.com/leoleoasd/s3-tee"
