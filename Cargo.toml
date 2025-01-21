@@ -1,0 +1,11 @@
+[package]
+edition = "2021"
+name = "tee-s3"
+version = "0.1.0"
+
+[dependencies]
+aws-config = "1.5.14"
+aws-sdk-s3 = "1.69.0"
+bytes = "1.0"
+clap = {version = "4", features = ["derive"]}
+tokio = {version = "1.0", features = ["full"]}
