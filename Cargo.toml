@@ -1,4 +1,5 @@
 [package]
+authors = ["Yuxuan Lu <i@yuxuan.lu>"]
 edition = "2021"
 name = "tee-s3"
 version = "0.1.0"

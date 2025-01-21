@@ -8,7 +8,8 @@ use clap::Parser;
 use std::sync::Arc;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
-use tokio::time::{self, Duration};
+
+const BUFFER_SIZE: usize = 8192; // 8KB buffer size
 
 #[derive(Parser)]
 #[command(
@@ -34,209 +35,211 @@ struct Args {
     key: String,
 }
 
+struct S3Uploader {
+    client: Client,
+    bucket: String,
+    key: String,
+    bytes_written: i64,
+}
+
+impl S3Uploader {
+    fn new(client: Client, bucket: String, key: String) -> Self {
+        Self {
+            client,
+            bucket,
+            key,
+            bytes_written: 0,
+        }
+    }
+
+    async fn initialize(&mut self) -> io::Result<()> {
+        // Check if object exists and get its size
+        match self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                self.bytes_written = response.content_length().unwrap_or(0);
+            }
+            Err(_) => {
+                self.bytes_written = 0; // Start from beginning for new objects
+            }
+        }
+        Ok(())
+    }
+
+    async fn upload_chunk(&mut self, data: Bytes) -> io::Result<()> {
+        let mut request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .set_checksum_algorithm(Some(ChecksumAlgorithm::Crc32C));
+
+        if self.bytes_written > 0 {
+            request = request.set_write_offset_bytes(Some(self.bytes_written));
+        }
+
+        match request.body(data.clone().into()).send().await {
+            Ok(_) => {
+                self.bytes_written += data.len() as i64;
+                Ok(())
+            }
+            Err(e) => {
+                if let SdkError::ServiceError(err) = &e {
+                    if matches!(err.err(), PutObjectError::TooManyParts(_)) {
+                        self.handle_too_many_parts(data).await?;
+                        return Ok(());
+                    }
+                }
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("S3 upload error: {}", e),
+                ))
+            }
+        }
+    }
+
+    async fn handle_too_many_parts(&mut self, data: Bytes) -> io::Result<()> {
+        let temp_key = format!("{}.temp", self.key);
+
+        // Copy to temporary object
+        self.copy_object(&self.key, &temp_key).await?;
+
+        // Copy back to original
+        self.copy_object(&temp_key, &self.key).await?;
+
+        // Delete temporary object
+        self.delete_object(&temp_key).await?;
+
+        // Retry the upload
+        let request = self
+            .client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&self.key)
+            .set_checksum_algorithm(Some(ChecksumAlgorithm::Crc32C))
+            .set_write_offset_bytes(Some(self.bytes_written));
+
+        match request.body(data.clone().into()).send().await {
+            Ok(_) => {
+                self.bytes_written += data.len() as i64;
+                Ok(())
+            }
+            Err(e) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to retry upload: {}", e),
+            )),
+        }
+    }
+
+    async fn copy_object(&self, from_key: &str, to_key: &str) -> io::Result<()> {
+        self.client
+            .copy_object()
+            .bucket(&self.bucket)
+            .key(to_key)
+            .copy_source(format!("{}/{}", self.bucket, from_key))
+            .send()
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to copy object: {}", e),
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn delete_object(&self, key: &str) -> io::Result<()> {
+        self.client
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to delete object: {}", e),
+                )
+            })?;
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args = Args::parse();
 
-    // Initialize AWS S3 client with profile and region
-    let mut config_builder = aws_config::defaults(BehaviorVersion::latest());
+    // Initialize AWS configuration
+    let config = aws_config::defaults(BehaviorVersion::latest())
+        .profile_name(args.profile.unwrap_or("default".to_string()))
+        .region(args.region.map(Region::new))
+        .load()
+        .await;
 
-    // Set profile if provided
-    if let Some(profile) = args.profile {
-        config_builder = config_builder.profile_name(profile);
-    }
-
-    // Set region if provided
-    if let Some(region) = args.region {
-        config_builder = config_builder.region(Region::new(region));
-    }
-
-    let config = config_builder.load().await;
     let client = Client::new(&config);
+    let mut uploader = S3Uploader::new(client, args.bucket, args.key);
+    uploader.initialize().await?;
 
-    // Create a shared BytesMut buffer
-    let shared_buffer = Arc::new(Mutex::new(BytesMut::new()));
+    let buffer = Arc::new(Mutex::new(BytesMut::with_capacity(BUFFER_SIZE)));
+    let is_done = Arc::new(Mutex::new(false));
 
-    // Clone the buffer for the producer (stdin task)
-    let producer_buffer = Arc::clone(&shared_buffer);
-
-    // Create a shared flag to indicate when stdin is done
-    let stdin_done = Arc::new(Mutex::new(false));
-    let stdin_done_producer = Arc::clone(&stdin_done);
-    let stdin_done_consumer = Arc::clone(&stdin_done);
-
-    // Task for reading stdin
-    let stdin_task = tokio::spawn(async move {
+    // Spawn stdin reader task
+    let stdin_buffer = Arc::clone(&buffer);
+    let stdin_done = Arc::clone(&is_done);
+    let stdin_handle = tokio::spawn(async move {
         let mut stdin = io::stdin();
-        let mut buffer = [0; 1024];
+        let mut read_buffer = [0; BUFFER_SIZE];
 
         loop {
-            match stdin.read(&mut buffer).await {
+            match stdin.read(&mut read_buffer).await {
                 Ok(0) => {
-                    // Set the done flag when EOF is reached
-                    *stdin_done_producer.lock().await = true;
-                    return Ok(());
+                    *stdin_done.lock().await = true;
+                    break Ok(()) as io::Result<()>;
                 }
-                Ok(bytes_read) => {
-                    let mut shared = producer_buffer.lock().await;
-                    io::stdout().write_all(&buffer[..bytes_read]).await?;
+                Ok(n) => {
+                    io::stdout().write_all(&read_buffer[..n]).await?;
                     io::stdout().flush().await?;
-                    shared.extend_from_slice(&buffer[..bytes_read]);
+                    stdin_buffer
+                        .lock()
+                        .await
+                        .extend_from_slice(&read_buffer[..n]);
                 }
-                Err(e) => {
-                    eprintln!("Error reading from stdin: {}", e);
-                    return Err(e);
-                }
+                Err(e) => break Err(e),
             }
         }
     });
 
-    // Clone the buffer for the consumer (S3 task)
-    let consumer_buffer = Arc::clone(&shared_buffer);
-    let s3_client = client.clone();
+    // Spawn S3 uploader task
+    let upload_buffer = Arc::clone(&buffer);
+    let upload_done = Arc::clone(&is_done);
+    let upload_handle: tokio::task::JoinHandle<io::Result<()>> = tokio::spawn(async move {
+        while !*upload_done.lock().await || !upload_buffer.lock().await.is_empty() {
+            let chunk = {
+                let mut buffer = upload_buffer.lock().await;
+                if buffer.is_empty() {
+                    continue;
+                }
+                buffer.split().freeze()
+            };
 
-    // Task for sending data to S3
-    let output_task = tokio::spawn(async move {
-        let mut bytes_written;
-        // read object size
-        let object = s3_client
-            .head_object()
-            .bucket(&args.bucket)
-            .key(&args.key)
-            .send()
-            .await;
-        if let Err(e) = object {
-            // object not found, start from the beginning
-            bytes_written = 0;
-        } else {
-            // object found, start from the end
-            bytes_written = object.unwrap().content_length().unwrap_or(0);
+            uploader.upload_chunk(chunk).await?;
         }
-        let mut parts = 0;
-        loop {
-            let mut shared = consumer_buffer.lock().await;
-            if shared.is_empty() {
-                // Check if stdin is done and buffer is empty
-                if *stdin_done_consumer.lock().await {
-                    return Ok(());
-                }
-                drop(shared);
-                time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
-
-            let data = shared.split_to(1);
-            let data: Bytes = data.freeze();
-            let data_len = data.len();
-            drop(shared);
-
-            // Send data to S3
-            let mut request = s3_client
-                .put_object()
-                .bucket(&args.bucket)
-                .key(&args.key)
-                .set_checksum_algorithm(Some(ChecksumAlgorithm::Crc32C));
-
-            if bytes_written > 0 {
-                request = request.set_write_offset_bytes(Some(bytes_written));
-            }
-
-            match request.body(data.clone().into()).send().await {
-                Ok(_) => {
-                    bytes_written += data_len as i64;
-                }
-                Err(e) => {
-                    if let SdkError::ServiceError(ref err) = e {
-                        if matches!(err.err(), PutObjectError::TooManyParts(_)) {
-                            // copy to a new object, copy back and retry
-                            let new_key = format!("{}.1", args.key);
-                            let new_object = s3_client
-                                .copy_object()
-                                .bucket(&args.bucket)
-                                .key(&new_key)
-                                .copy_source(format!("{}/{}", args.bucket, args.key))
-                                .send()
-                                .await;
-                            if let Err(e) = new_object {
-                                eprintln!("Failed to copy to new object: {:?}", e);
-                                return Err(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    format!("S3 upload error: {:?}", e),
-                                ));
-                            }
-                            // copy back to original object
-                            let copy_back = s3_client
-                                .copy_object()
-                                .bucket(&args.bucket)
-                                .key(&args.key)
-                                .copy_source(format!("{}/{}", args.bucket, new_key))
-                                .send()
-                                .await;
-                            if let Err(e) = copy_back {
-                                eprintln!("Failed to copy back to original object: {:?}", e);
-                                return Err(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    format!("S3 upload error: {:?}", e),
-                                ));
-                            }
-                            // delete the new object
-                            let delete_new = s3_client
-                                .delete_object()
-                                .bucket(&args.bucket)
-                                .key(&new_key)
-                                .send()
-                                .await;
-                            if let Err(e) = delete_new {
-                                eprintln!("Failed to delete new object: {:?}", e);
-                                return Err(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    format!("S3 upload error: {:?}", e),
-                                ));
-                            }
-                            // retry
-                            let request = s3_client
-                                .put_object()
-                                .bucket(&args.bucket)
-                                .key(&args.key)
-                                .set_checksum_algorithm(Some(ChecksumAlgorithm::Crc32C))
-                                .set_write_offset_bytes(Some(bytes_written));
-                            match request.body(data.into()).send().await {
-                                Ok(_) => {
-                                    bytes_written += data_len as i64;
-                                }
-                                Err(e) => {
-                                    eprintln!("Failed to retry upload: {:?}", e);
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::Other,
-                                        format!("S3 upload error: {:?}", e),
-                                    ));
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    eprintln!("Failed to upload to S3: {:?}", e);
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("S3 upload error: {:?}", e),
-                    ));
-                }
-            }
-            parts += 1;
-            println!("parts: {}", parts);
-        }
+        Ok(())
     });
 
-    // Run tasks and handle their results
-    match tokio::try_join!(stdin_task, output_task) {
-        Ok((stdin_result, output_result)) => {
+    // Wait for both tasks to complete
+    match tokio::try_join!(stdin_handle, upload_handle) {
+        Ok((stdin_result, upload_result)) => {
             stdin_result?;
-            output_result?;
+            upload_result?;
             Ok(())
         }
-        Err(e) => {
-            eprintln!("Task error: {}", e);
-            Err(io::Error::new(io::ErrorKind::Other, "Task failed"))
-        }
+        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
     }
 }
