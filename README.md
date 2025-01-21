@@ -1,4 +1,4 @@
-# s3-tee
+# tee-s3
 
 A command-line utility that streams stdin to both stdout and Amazon S3, similar to the Unix `tee` command but with S3 as an additional output.
 
@@ -17,7 +17,7 @@ To allow real-time outputs, this tool will produce **one PutObject request at ev
 ## Installation
 
 ```boto3
-cargo install s3-tee
+cargo install tee-s3
 ```
 
 ## Usage
@@ -25,7 +25,7 @@ cargo install s3-tee
 my-bucket have to be a directory bucket.
 
 ```boto3
-s3-tee --bucket my-bucket --key my-key
+tee-s3 --bucket my-bucket --key my-key
 ```
 
 
@@ -39,13 +39,13 @@ s3-tee --bucket my-bucket --key my-key
 ### Example
 ```bash
 # Stream a file to both stdout and S3
-cat large-file.txt | s3-tee --bucket my-bucket --key logs/large-file.txt
+cat large-file.txt | tee-s3 --bucket my-bucket --key logs/large-file.txt
 
 # Use with other Unix commands
-echo "Hello, World!" | s3-tee --bucket my-bucket --key hello.txt
+echo "Hello, World!" | tee-s3 --bucket my-bucket --key hello.txt
 
 # Specify AWS profile and region
-python3 train.py | s3-tee --bucket logs-bucket --key app.log --profile prod --region us-west-2
+python3 train.py | tee-s3 --bucket logs-bucket --key app.log --profile prod --region us-west-2
 ```
 
 
