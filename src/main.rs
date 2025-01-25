@@ -5,9 +5,11 @@ use aws_sdk_s3::types::ChecksumAlgorithm;
 use aws_sdk_s3::{config::Region, Client};
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
+use std::f32::consts::E;
 use std::sync::Arc;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio::time::Duration;
 
 const BUFFER_SIZE: usize = 8192; // 8KB buffer size
 
@@ -72,7 +74,7 @@ impl S3Uploader {
         Ok(())
     }
 
-    async fn upload_chunk(&mut self, data: Bytes) -> io::Result<()> {
+    async fn upload_chunk(&mut self, data: &Bytes) -> io::Result<()> {
         let mut request = self
             .client
             .put_object()
@@ -104,7 +106,7 @@ impl S3Uploader {
         }
     }
 
-    async fn handle_too_many_parts(&mut self, data: Bytes) -> io::Result<()> {
+    async fn handle_too_many_parts(&mut self, data: &Bytes) -> io::Result<()> {
         let temp_key = format!("{}.temp", self.key);
 
         // Copy to temporary object
@@ -218,8 +220,11 @@ async fn main() -> io::Result<()> {
     // Spawn S3 uploader task
     let upload_buffer = Arc::clone(&buffer);
     let upload_done = Arc::clone(&is_done);
+    let mut tick = tokio::time::interval(Duration::from_millis(1000));
     let upload_handle: tokio::task::JoinHandle<io::Result<()>> = tokio::spawn(async move {
+        let mut retry_count = 0;
         while !*upload_done.lock().await || !upload_buffer.lock().await.is_empty() {
+            tick.tick().await;
             let chunk = {
                 let mut buffer = upload_buffer.lock().await;
                 if buffer.is_empty() {
@@ -228,7 +233,23 @@ async fn main() -> io::Result<()> {
                 buffer.split().freeze()
             };
 
-            uploader.upload_chunk(chunk).await?;
+            // uploader.upload_chunk(chunk).await?;
+            let result = uploader.upload_chunk(&chunk).await;
+            if let Err(e) = result {
+                eprintln!("Failed to upload chunk: {:?}", e);
+                retry_count += 1;
+                if retry_count > 10 {
+                    eprintln!("Failed to upload chunk after 10 retries, giving up");
+                    break;
+                }
+                let mut buffer = upload_buffer.lock().await;
+                let existing_data = buffer.split().freeze();
+                buffer.extend_from_slice(&chunk);
+                buffer.extend_from_slice(&existing_data);
+                tokio::time::sleep(Duration::from_secs(retry_count)).await;
+            } else {
+                retry_count = 0;
+            }
         }
         Ok(())
     });
