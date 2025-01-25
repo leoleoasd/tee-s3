@@ -98,7 +98,7 @@ impl S3Uploader {
                 }
                 Err(io::Error::new(
                     io::ErrorKind::Other,
-                    format!("S3 upload error: {}", e),
+                    format!("S3 upload error: {:?}", e),
                 ))
             }
         }
@@ -132,7 +132,7 @@ impl S3Uploader {
             }
             Err(e) => Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("Failed to retry upload: {}", e),
+                format!("Failed to retry upload: {:?}", e),
             )),
         }
     }
@@ -148,7 +148,7 @@ impl S3Uploader {
             .map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::Other,
-                    format!("Failed to copy object: {}", e),
+                    format!("Failed to copy object: {:?}", e),
                 )
             })?;
         Ok(())
@@ -164,7 +164,7 @@ impl S3Uploader {
             .map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::Other,
-                    format!("Failed to delete object: {}", e),
+                    format!("Failed to delete object: {:?}", e),
                 )
             })?;
         Ok(())
