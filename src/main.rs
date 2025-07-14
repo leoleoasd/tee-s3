@@ -8,6 +8,7 @@ use clap::Parser;
 use std::f32::consts::E;
 use std::sync::Arc;
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 
@@ -35,6 +36,19 @@ struct Args {
     /// S3 object key
     #[arg(long)]
     key: String,
+
+    /// Upload interval (e.g., "1s", "60s", "1m"). Default unit is seconds, default value is "60s"
+    #[arg(long, default_value = "60s")]
+    interval: String,
+}
+
+fn parse_duration_with_default_seconds(input: &str) -> Result<Duration, humantime::DurationError> {
+    // If it's just a number, append 's' for seconds
+    if input.trim().chars().all(|c| c.is_ascii_digit()) {
+        humantime::parse_duration(&format!("{}s", input.trim()))
+    } else {
+        humantime::parse_duration(input)
+    }
 }
 
 struct S3Uploader {
@@ -118,7 +132,11 @@ impl S3Uploader {
         // Delete temporary object
         self.delete_object(&temp_key).await?;
 
-        // Retry the upload
+        // Retry the upload if the data is not empty
+        if data.is_empty() {
+            return Ok(());
+        }
+
         let request = self
             .client
             .put_object()
@@ -188,8 +206,26 @@ async fn main() -> io::Result<()> {
     let mut uploader = S3Uploader::new(client, args.bucket, args.key);
     uploader.initialize().await?;
 
+    // Parse upload interval
+    let upload_interval = parse_duration_with_default_seconds(&args.interval)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
     let buffer = Arc::new(Mutex::new(BytesMut::with_capacity(BUFFER_SIZE)));
     let is_done = Arc::new(Mutex::new(false));
+
+    // Set up Ctrl-C handler
+    let signal_done = Arc::clone(&is_done);
+    let signal_handle = tokio::spawn(async move {
+        match signal::ctrl_c().await {
+            Ok(()) => {
+                eprintln!("\nReceived Ctrl-C, finishing upload...");
+                *signal_done.lock().await = true;
+            }
+            Err(err) => {
+                eprintln!("Unable to listen for shutdown signal: {}", err);
+            }
+        }
+    });
 
     // Spawn stdin reader task
     let stdin_buffer = Arc::clone(&buffer);
@@ -199,6 +235,11 @@ async fn main() -> io::Result<()> {
         let mut read_buffer = [0; BUFFER_SIZE];
 
         loop {
+            // Check if we should stop (e.g., due to Ctrl-C)
+            if *stdin_done.lock().await {
+                break Ok(()) as io::Result<()>;
+            }
+            
             match stdin.read(&mut read_buffer).await {
                 Ok(0) => {
                     *stdin_done.lock().await = true;
@@ -220,7 +261,7 @@ async fn main() -> io::Result<()> {
     // Spawn S3 uploader task
     let upload_buffer = Arc::clone(&buffer);
     let upload_done = Arc::clone(&is_done);
-    let mut tick = tokio::time::interval(Duration::from_millis(1000));
+    let mut tick = tokio::time::interval(upload_interval);
     let upload_handle: tokio::task::JoinHandle<io::Result<()>> = tokio::spawn(async move {
         let mut retry_count = 0;
         while !*upload_done.lock().await || !upload_buffer.lock().await.is_empty() {
@@ -251,12 +292,14 @@ async fn main() -> io::Result<()> {
                 retry_count = 0;
             }
         }
+        // copy the object again to make it single-part
+        uploader.handle_too_many_parts(&Bytes::new()).await?;
         Ok(())
     });
 
     // Wait for both tasks to complete
-    match tokio::try_join!(stdin_handle, upload_handle) {
-        Ok((stdin_result, upload_result)) => {
+    match tokio::try_join!(stdin_handle, upload_handle, signal_handle) {
+        Ok((stdin_result, upload_result, _)) => {
             stdin_result?;
             upload_result?;
             Ok(())
